@@ -42,9 +42,13 @@ Press **Help & Guides** in the main menu for everything else.
 
 ## Multiplayer
 
-**Host from the game:** load a world, Esc, **Open to LAN / Host**. PyCraft asks your router to open TCP 25565 (UPnP)
-and prints your **public address** in chat for friends on other networks. If your router refuses, forward TCP 25565
-to your PC manually. Set a password under Multiplayer > Password first if the server is public.
+**Host from the game:** load a world, Esc, **Open to LAN / Host**. PyCraft opens the port on your router by itself
+(UPnP, falling back to NAT-PMP), keeps it open while you play, closes it when you stop, and prints the **public
+address** for friends on other networks in chat. Set a password under Multiplayer > Password first.
+
+If chat says the router refused: switch on UPnP in your router's settings (the page address is shown in chat) or
+forward TCP 25565 manually. If chat says you are behind **CGNAT**, your internet provider blocks incoming connections
+and no port forwarding can work. Use Tailscale / ZeroTier / Radmin VPN, or run the dedicated server on a VPS.
 
 **Join:** main menu, Multiplayer, enter name + `host:port` (+ password), Join.
 

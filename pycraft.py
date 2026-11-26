@@ -9144,50 +9144,180 @@ def public_ip(timeout=4):
     return None
 
 
-def upnp_open(port, desc='PyCraft', timeout=3.):
-    """Ask the router (UPnP IGD) to forward TCP `port` to this PC. Returns a handle for upnp_close, or None."""
+def default_gateway():
+    """Best guess of the router's LAN address (Linux, Windows, macOS), or None."""
+    import subprocess, re
+    if os.environ.get('PYCRAFT_GATEWAY'):
+        return os.environ['PYCRAFT_GATEWAY']
+    try:
+        with open('/proc/net/route') as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if parts[1] == '00000000' and int(parts[3], 16) & 2:
+                    return socket.inet_ntoa(struct.pack('<I', int(parts[2], 16)))
+    except (OSError, IndexError, ValueError):
+        pass
+    for cmd in (['route', 'print', '-4', '0.0.0.0'], ['route', '-n', 'get', 'default'], ['ip', 'route']):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3,
+                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).stdout
+        except Exception:
+            continue
+        m = re.search(r'0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)', out) or \
+            re.search(r'gateway:\s*(\d+\.\d+\.\d+\.\d+)', out) or re.search(r'default via (\d+\.\d+\.\d+\.\d+)', out)
+        if m:
+            return m.group(1)
+    ip = local_ip()
+    return ip.rsplit('.', 1)[0] + '.1' if ip.count('.') == 3 and not ip.startswith('127.') else None
+
+
+def is_private_ip(ip):
+    try:
+        a, b = (int(x) for x in ip.split('.')[:2])
+    except (ValueError, AttributeError):
+        return False
+    return a == 10 or (a == 172 and 16 <= b < 32) or (a == 192 and b == 168) or (a == 100 and 64 <= b < 128)
+
+
+def _ssdp_locations(timeout):
+    import re
+    locs, me = [], local_ip()
+    for st in ('urn:schemas-upnp-org:device:InternetGatewayDevice:1', 'urn:schemas-upnp-org:device:InternetGatewayDevice:2',
+               'urn:schemas-upnp-org:service:WANIPConnection:1', 'urn:schemas-upnp-org:service:WANIPConnection:2',
+               'urn:schemas-upnp-org:service:WANPPPConnection:1'):
+        msg = ('M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\nST: %s\r\n\r\n' % st).encode()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            if not me.startswith('127.'):
+                try:                                       # send out of the LAN interface, not a VPN / virtual one
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(me))
+                except OSError:
+                    pass
+            sock.settimeout(timeout / 2.)
+            for _ in range(2):
+                sock.sendto(msg, ('239.255.255.250', 1900))
+            while True:
+                data = sock.recv(4096).decode(errors='ignore')
+                m = re.search(r'(?im)^location:\s*(\S+)', data)
+                if m and m.group(1) not in locs:
+                    locs.append(m.group(1))
+        except OSError:
+            pass
+        finally:
+            sock.close()
+        if locs:
+            break
+    return locs
+
+
+def _igd_map(loc, port, desc, timeout):
+    """Given a router description URL, add a TCP mapping. Returns a handle dict or None."""
     import urllib.request, re
     from urllib.parse import urljoin
-    msg = ('M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\n'
-           'ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n').encode()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.settimeout(timeout)
-    locs = []
-    try:
-        sock.sendto(msg, ('239.255.255.250', 1900))
-        while True:
-            data = sock.recv(4096).decode(errors='ignore')
-            m = re.search(r'(?im)^location:\s*(\S+)', data)
-            if m and m.group(1) not in locs:
-                locs.append(m.group(1))
-    except OSError:
-        pass
-    finally:
-        sock.close()
+    with urllib.request.urlopen(loc, timeout=timeout) as r:
+        xml = r.read().decode(errors='ignore')
+    base = re.search(r'<URLBase>\s*([^<\s]+)', xml)
+    base = base.group(1) if base else loc
     me = local_ip()
-    for loc in locs:
-        try:
-            with urllib.request.urlopen(loc, timeout=timeout) as r:
-                xml = r.read().decode(errors='ignore')
-            for svc in ('WANIPConnection', 'WANPPPConnection'):
-                m = re.search(r'<serviceType>(urn:schemas-upnp-org:service:%s:\d)</serviceType>.*?<controlURL>([^<]+)'
-                              '</controlURL>' % svc, xml, re.S)
-                if not m:
-                    continue
-                st, ctrl = m.group(1), urljoin(loc, m.group(2))
+    for svc in ('WANIPConnection', 'WANPPPConnection'):
+        for m in re.finditer(r'<serviceType>\s*(urn:schemas-upnp-org:service:%s:\d)\s*</serviceType>.*?<controlURL>\s*'
+                             r'([^<\s]+)\s*</controlURL>' % svc, xml, re.S):
+            st, ctrl = m.group(1), urljoin(base, m.group(2))
+            for lease in (0, 86400, 7200):                 # some routers refuse permanent (0) leases
                 args = ('<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort><NewProtocol>TCP'
                         '</NewProtocol><NewInternalPort>%d</NewInternalPort><NewInternalClient>%s</NewInternalClient>'
                         '<NewEnabled>1</NewEnabled><NewPortMappingDescription>%s</NewPortMappingDescription>'
-                        '<NewLeaseDuration>0</NewLeaseDuration>' % (port, port, me, desc))
-                if _soap(ctrl, st, 'AddPortMapping', args, timeout):
-                    return (ctrl, st, port)
-        except Exception:
-            pass
+                        '<NewLeaseDuration>%d</NewLeaseDuration>' % (port, port, me, desc, lease))
+                ok, body = _soap(ctrl, st, 'AddPortMapping', args, timeout)
+                if not ok and '718' in body:               # a stale mapping (often our own) is in the way
+                    _soap(ctrl, st, 'DeletePortMapping', '<NewRemoteHost></NewRemoteHost><NewExternalPort>%d'
+                          '</NewExternalPort><NewProtocol>TCP</NewProtocol>' % port, timeout)
+                    ok, body = _soap(ctrl, st, 'AddPortMapping', args, timeout)
+                if ok:
+                    ok2, b2 = _soap(ctrl, st, 'GetExternalIPAddress', '', timeout)
+                    ext = re.search(r'<NewExternalIPAddress>\s*([^<\s]+)', b2) if ok2 else None
+                    return {'kind': 'upnp', 'ctrl': ctrl, 'st': st, 'port': port, 'internal': port, 'lease': lease,
+                            'router_ip': ext.group(1) if ext else None}
     return None
 
 
+def _natpmp(port, lifetime=7200, timeout=2.):
+    """NAT-PMP (RFC 6886) mapping request to the gateway. Returns a handle dict or None."""
+    gw = default_gateway()
+    if not gw:
+        return None
+    dest = (gw, int(os.environ.get('PYCRAFT_NATPMP_PORT', 5351)))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout / 4.)
+        req = struct.pack('!BBHHHI', 0, 2, 0, port, port, lifetime)
+        for _ in range(4):
+            try:
+                sock.sendto(req, dest)
+                data = sock.recv(64)
+            except OSError:
+                continue
+            if len(data) >= 16:
+                ver, op, code, epoch, internal, external, life = struct.unpack('!BBHIHHI', data[:16])
+                if op == 130 and code == 0:
+                    ext_ip = None
+                    try:                                   # opcode 0: ask for the router's public IP
+                        sock.sendto(struct.pack('!BB', 0, 0), dest)
+                        d2 = sock.recv(64)
+                        if len(d2) >= 12 and d2[1] == 128:
+                            ext_ip = socket.inet_ntoa(d2[8:12])
+                    except OSError:
+                        pass
+                    return {'kind': 'natpmp', 'gw': gw, 'port': external, 'internal': port, 'lease': life,
+                            'router_ip': ext_ip}
+                return None
+    finally:
+        sock.close()
+    return None
+
+
+def upnp_open(port, desc='PyCraft', timeout=3.):
+    """Open TCP `port` on the router automatically: UPnP IGD first, then NAT-PMP. Handle dict or None."""
+    for loc in _ssdp_locations(timeout):
+        try:
+            h = _igd_map(loc, port, desc, timeout)
+            if h:
+                return h
+        except Exception:
+            pass
+    try:
+        return _natpmp(port)
+    except Exception:
+        return None
+
+
+def upnp_renew(handle):
+    """Leases that expire (NAT-PMP, timed UPnP) are refreshed while hosting."""
+    if handle and handle.get('lease'):
+        fresh = _natpmp(handle['internal'], handle['lease']) if handle['kind'] == 'natpmp' else upnp_open(handle['internal'])
+        if fresh:
+            handle.update(fresh)
+
+
+def nat_report(handle, public, port=None):
+    """Human-readable lines about whether internet players can reach us."""
+    port = port or NET_PORT
+    if handle and handle.get('router_ip') and public and handle['router_ip'] != public and is_private_ip(handle['router_ip']):
+        return ['Your router opened the port, but your internet provider puts you behind ANOTHER router (CGNAT:',
+                'router says %s, internet sees %s), so port forwarding cannot work on this connection.' % (handle['router_ip'], public),
+                'Use Tailscale / ZeroTier / Radmin VPN, or run the dedicated server on a VPS.']
+    if handle:
+        return ['Port opened automatically via %s. Internet players join at  %s:%d' % (
+            'UPnP' if handle['kind'] == 'upnp' else 'NAT-PMP', public or '<your public IP>', handle['port'])]
+    return ['Your router did not allow automatic port forwarding. Turn on "UPnP" (or "NAT-PMP") in your router',
+            'settings (usually http://%s ), or forward TCP %d to %s manually. Then join at  %s:%d' % (
+                default_gateway() or '192.168.1.1', port, local_ip(), public or '<your public IP>', port),
+            'No router access? Use Tailscale / Radmin VPN instead.']
+
+
 def _soap(ctrl, st, action, args, timeout):
-    import urllib.request
+    import urllib.request, urllib.error
     body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
             's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:%s xmlns:u="%s">%s</u:%s>'
             '</s:Body></s:Envelope>' % (action, st, args, action)).encode()
@@ -9195,17 +9325,31 @@ def _soap(ctrl, st, action, args, timeout):
                                               'SOAPAction': '"%s#%s"' % (st, action)})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status == 200
+            return r.status == 200, r.read(8192).decode(errors='ignore')
+    except urllib.error.HTTPError as e:
+        try:
+            return False, e.read(8192).decode(errors='ignore')
+        except Exception:
+            return False, ''
     except Exception:
-        return False
+        return False, ''
 
 
 def upnp_close(handle):
-    if handle:
-        ctrl, st, port = handle
-        _soap(ctrl, st, 'DeletePortMapping', '<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort>'
-                                             '<NewProtocol>TCP</NewProtocol>' % port, 3.)
-
+    if not handle:
+        return
+    try:
+        if handle['kind'] == 'natpmp':
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(1.)
+            sock.sendto(struct.pack('!BBHHHI', 0, 2, 0, handle['internal'], 0, 0),
+                        (handle['gw'], int(os.environ.get('PYCRAFT_NATPMP_PORT', 5351))))
+            sock.close()
+        else:
+            _soap(handle['ctrl'], handle['st'], 'DeletePortMapping', '<NewRemoteHost></NewRemoteHost><NewExternalPort>'
+                  '%d</NewExternalPort><NewProtocol>TCP</NewProtocol>' % handle['port'], 3.)
+    except Exception:
+        pass
 
 class Conn:
     """One TCP peer: length-prefixed JSON messages, reader + writer threads."""
@@ -9978,21 +10122,24 @@ def _open_to_lan(self):
         local_ip(), NET_PORT, '  (password protected)' if self.settings.get('password') else ''))
     self.chat_show('', 'Opening port %d on your router and looking up your public address...' % NET_PORT)
 
-    def go_public():                                    # background: UPnP + public IP, reported in chat
+    def go_public():                                    # background: router port + public IP, reported in chat
         h = upnp_open(NET_PORT)
         net.upnp = h
         ip = public_ip()
         if self.net is not net:
             upnp_close(h)
             return
-        if ip and h:
-            net.public = '%s:%d' % (ip, NET_PORT)
-            self.chat_show('', 'Public server is up! Internet players join at  %s' % net.public)
-        elif ip:
-            self.chat_show('', 'Your router did not allow automatic port forwarding (UPnP off?).')
-            self.chat_show('', 'Forward TCP %d to %s manually, then friends join at  %s:%d' % (NET_PORT, local_ip(), ip, NET_PORT))
-        else:
+        if not ip:
             self.chat_show('', 'Could not reach the internet to find your public IP - LAN only.')
+            return
+        if h:
+            net.public = '%s:%d' % (ip, h['port'])
+        for line in nat_report(h, ip):
+            self.chat_show('', line)
+        while self.net is net and h and h.get('lease'):   # keep timed leases alive while hosting
+            time.sleep(max(60, h['lease'] * .45))
+            if self.net is net:
+                upnp_renew(h)
     threading.Thread(target=go_public, daemon=True).start()
     self.adv('mp')
 
@@ -10028,11 +10175,11 @@ HELP_PAGES = [
                  'Two slabs of the same kind stacked turn into a full block.'),
     ('Multiplayer - hosting', '1. Load or create a world and press Esc.\n'
                               '2. Click "Open to LAN / Host". LAN friends join with the address shown in chat.\n'
-                              '3. PyCraft also asks your router to open port 25565 (UPnP) and shows your PUBLIC\n'
-                              '   address in chat - give that to friends on other networks.\n'
+                              '3. PyCraft opens the port on your router itself (UPnP / NAT-PMP) and shows your\n'
+                              '   PUBLIC address in chat - give that to friends on other networks.\n'
                               '4. Set a password in Multiplayer > Password before hosting a public server.\n\n'
-                              'If chat says UPnP was refused: forward TCP 25565 to this PC in your router, and allow\n'
-                              'Python through the firewall (Windows asks; tick Private AND Public).\n\n'
+                              'Refused? Turn on UPnP in the router or forward TCP 25565. "CGNAT" = your ISP blocks it:\n'
+                              'use Tailscale / Radmin VPN. Allow Python through the Windows firewall (Private + Public).\n\n'
                               'Dedicated 24/7 server on Linux (no screen needed):\n'
                               '   python3 pycraft.py --server --password <pw>\n'
                               'Options: --port --world --seed --max-players --no-upnp.  See README.md.'),
@@ -10869,9 +11016,17 @@ class DedicatedServer:
             h = None if a.no_upnp else upnp_open(a.port, 'PyCraft server')
             self.upnp = h
             ip = public_ip()
-            if ip:
-                self.log('Public address: %s:%d %s' % (ip, a.port, '(router port opened via UPnP)' if h else
-                                                       '(make sure TCP %d is open in the firewall / forwarded)' % a.port))
+            if not ip:
+                self.log('No internet connection found - LAN only')
+                return
+            if a.no_upnp:
+                self.log('Public address: %s:%d  (make sure TCP %d is open in the firewall)' % (ip, a.port, a.port))
+            else:
+                for line in nat_report(h, ip, a.port):
+                    self.log(line)
+            while not self.stop_flag and h and h.get('lease'):
+                time.sleep(max(60, h['lease'] * .45))
+                upnp_renew(h)
         self.upnp = None
         threading.Thread(target=go_public, daemon=True).start()
         last, env_t, save_t = time.time(), 0., 0.
