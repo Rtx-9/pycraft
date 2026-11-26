@@ -1,0 +1,21 @@
+# systemd unit for a 24/7 PyCraft server.
+# 1. Put the repo in /opt/pycraft and run ./server.sh once (creates .venv), then Ctrl+C.
+# 2. sudo useradd --system --home /opt/pycraft pycraft && sudo chown -R pycraft /opt/pycraft
+# 3. sudo cp pycraft-server.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# 4. sudo systemctl enable --now pycraft-server      (logs: journalctl -u pycraft-server -f)
+[Unit]
+Description=PyCraft dedicated server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pycraft
+WorkingDirectory=/opt/pycraft
+Environment=PYCRAFT_PASSWORD=change-me
+ExecStart=/opt/pycraft/.venv/bin/python /opt/pycraft/pycraft.py --server --world /opt/pycraft/world.sav --no-upnp
+Restart=on-failure
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

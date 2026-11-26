@@ -1,0 +1,4 @@
+panda3d>=1.10
+numpy>=1.22
+# optional: Discord rich presence
+# pypresence
